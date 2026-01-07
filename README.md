@@ -163,7 +163,7 @@ disk I/O is factored out, buffered reading is around 20% slower than unbuffered
 reading. But over very large trajectories where only a subset of positions from
 the top of each frame is selected, the advantage is considerable.
 
-[sourcehut]: https://git.sr.ht/ma3ke/molly
+[sourcehut]: https://git.sr.ht/~ma3ke/molly
 [github]: https://github.com/ma3ke/molly
 [contact]: https://dwangschematiek.nl/where
 [xtc]: https://manual.gromacs.org/current/reference-manual/file-formats.html#xtc
