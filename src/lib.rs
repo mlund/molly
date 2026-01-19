@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::{cell::Cell, path::Path};
 
 use glam::{Mat3, Vec3};
@@ -10,10 +10,12 @@ use crate::reader::{
     read_boxvec, read_compressed_positions, read_f32, read_f32s, read_i32, read_u32,
 };
 use crate::selection::{AtomSelection, FrameSelection};
+use crate::writer::write_compressed_positions;
 
 pub mod buffer;
 pub mod reader;
 pub mod selection;
+pub mod writer;
 
 // See https://gitlab.com/gromacs/gromacs/-/blob/v2024.1/src/gromacs/fileio/xdrf.h?ref_type=tags#L78
 pub const XTC_1995_MAX_NATOMS: usize = 298261617;
@@ -260,7 +262,7 @@ impl<R: Read> XTCReader<R> {
         // basically invalid, or just irrelevant here, since we don't decode them. They were
         // never compressed to begin with.
 
-        Ok(buf.len() * std::mem::size_of::<f32>())
+        Ok(std::mem::size_of_val(buf))
     }
 
     /// A convenience function to read all frames in a trajectory.
@@ -538,5 +540,72 @@ impl XTCReader<File> {
         atom_selection: &AtomSelection,
     ) -> io::Result<()> {
         self.read_frame_with_scratch_impl::<Buffer>(frame, scratch, atom_selection)
+    }
+}
+
+/// Writer for XTC trajectory files.
+#[derive(Debug, Clone)]
+pub struct XTCWriter<W> {
+    pub file: W,
+    pub magic: Magic,
+}
+
+impl XTCWriter<std::fs::File> {
+    /// Create a new XTC file at the given path.
+    pub fn create<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = std::fs::File::create(path)?;
+        Ok(Self::new(file))
+    }
+}
+
+impl<W: Write> XTCWriter<W> {
+    /// Create a new XTC writer wrapping the given writer.
+    pub fn new(writer: W) -> Self {
+        Self::new_with_magic(writer, Magic::Xtc1995)
+    }
+
+    /// Create a new XTC writer with a specific magic number.
+    pub fn new_with_magic(writer: W, magic: Magic) -> Self {
+        Self {
+            file: writer,
+            magic,
+        }
+    }
+
+    /// Write a frame to the XTC file.
+    pub fn write_frame(&mut self, frame: &Frame) -> io::Result<()> {
+        let natoms = frame.natoms();
+
+        let header = Header {
+            magic: self.magic,
+            natoms,
+            step: frame.step,
+            time: frame.time,
+            boxvec: frame.boxvec,
+            natoms_repeated: natoms,
+        };
+
+        self.file.write_all(&header.to_be_bytes())?;
+
+        if natoms <= 9 {
+            self.write_smol_positions(&frame.positions)
+        } else {
+            self.file.write_all(&frame.precision.to_be_bytes())?;
+            write_compressed_positions(
+                &mut self.file,
+                &frame.positions,
+                frame.precision,
+                self.magic,
+            )?;
+            Ok(())
+        }
+    }
+
+    /// Write uncompressed positions for small frames (≤9 atoms).
+    fn write_smol_positions(&mut self, positions: &[f32]) -> io::Result<()> {
+        for &pos in positions {
+            self.file.write_all(&pos.to_be_bytes())?;
+        }
+        Ok(())
     }
 }
