@@ -6,6 +6,28 @@ use crate::{padding, Magic};
 /// XDR padding bytes.
 const ZERO_PAD: [u8; 3] = [0; 3];
 
+/// Maximum size that can be safely multiplied without overflow in sizeofints.
+const MAX_MULTIPLIABLE_SIZE: u32 = 0x00ff_ffff;
+
+/// Maximum run length: 8 coordinate triplets.
+const MAX_RUN_COORDS: usize = 8 * 3;
+
+/// Tracks whether the encoding precision should change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SizeChange {
+    Decrease,
+    Same,
+    Increase,
+}
+
+/// Check if all coordinate components are within threshold of each other.
+#[inline]
+fn coords_within_threshold(a: [i32; 3], b: [i32; 3], threshold: i32) -> bool {
+    (a[0] - b[0]).abs() < threshold
+        && (a[1] - b[1]).abs() < threshold
+        && (a[2] - b[2]).abs() < threshold
+}
+
 #[derive(Default)]
 struct EncodeState {
     /// Number of pending bits in lastbyte (0-7).
@@ -81,6 +103,52 @@ const fn pack_into_u64(nums: [i32; 3], sizes: [u32; 3]) -> u64 {
         .wrapping_add(nums[2] as u64)
 }
 
+/// Write a packed value LSB-first with the given number of bits.
+fn write_packed_bits(buf: &mut Vec<u8>, state: &mut EncodeState, packed: u64, nbits: u32) {
+    let mut byte_idx = 0u32;
+    let mut bits_left = nbits;
+
+    while bits_left >= 8 {
+        encodebyte(buf, state, (packed >> (8 * byte_idx)) as u8);
+        byte_idx += 1;
+        bits_left -= 8;
+    }
+    if bits_left > 0 {
+        let mask = (1u64 << bits_left) - 1;
+        encodebits(buf, state, ((packed >> (8 * byte_idx)) & mask) as u32, bits_left as usize);
+    }
+}
+
+/// Multiply byte array by a factor and propagate carry.
+fn multiply_bytes(bytes: &mut [u8; 32], nbytes: &mut usize, factor: u64) {
+    let mut carry = 0u64;
+    for byte in bytes.iter_mut().take(*nbytes) {
+        carry += *byte as u64 * factor;
+        *byte = (carry & 0xff) as u8;
+        carry >>= 8;
+    }
+    while carry > 0 {
+        bytes[*nbytes] = (carry & 0xff) as u8;
+        carry >>= 8;
+        *nbytes += 1;
+    }
+}
+
+/// Add a value to byte array and propagate carry.
+fn add_to_bytes(bytes: &mut [u8; 32], nbytes: &mut usize, value: u64) {
+    let mut carry = value;
+    for byte in bytes.iter_mut().take((*nbytes).max(4)) {
+        carry += *byte as u64;
+        *byte = (carry & 0xff) as u8;
+        carry >>= 8;
+    }
+    while carry > 0 {
+        bytes[*nbytes] = (carry & 0xff) as u8;
+        carry >>= 8;
+        *nbytes += 1;
+    }
+}
+
 fn encodeints(
     buf: &mut Vec<u8>,
     state: &mut EncodeState,
@@ -89,113 +157,37 @@ fn encodeints(
     nums: [i32; 3],
 ) {
     if nbits <= 32 {
-        let packed = pack_into_u32(nums, sizes);
-        // Write bytes LSB first (matching how decodeints reads them).
-        let mut nbytes = 0;
-        let mut bits_left = nbits;
-        while bits_left >= 8 {
-            encodebyte(buf, state, (packed >> (8 * nbytes)) as u8);
-            nbytes += 1;
-            bits_left -= 8;
-        }
-        if bits_left > 0 {
-            encodebits(
-                buf,
-                state,
-                (packed >> (8 * nbytes)) & ((1 << bits_left) - 1),
-                bits_left as usize,
-            );
-        }
+        write_packed_bits(buf, state, pack_into_u32(nums, sizes) as u64, nbits);
         return;
     }
 
     if nbits <= 64 {
-        let packed = pack_into_u64(nums, sizes);
-        let mut nbytes = 0;
-        let mut bits_left = nbits;
-        while bits_left >= 8 {
-            encodebyte(buf, state, (packed >> (8 * nbytes)) as u8);
-            nbytes += 1;
-            bits_left -= 8;
-        }
-        if bits_left > 0 {
-            encodebits(
-                buf,
-                state,
-                ((packed >> (8 * nbytes)) & ((1 << bits_left) - 1)) as u32,
-                bits_left as usize,
-            );
-        }
+        write_packed_bits(buf, state, pack_into_u64(nums, sizes), nbits);
         return;
     }
 
     // For very large nbits, use the byte array method (inverse of decodeints).
     let mut bytes = [0u8; 32];
-    let mut nbytes: usize = 0;
+    let mut nbytes = 0usize;
 
-    // Pack nums[2], nums[1], nums[0] into bytes (reverse order of unpacking).
+    // Initialize with nums[2].
     let mut carry = nums[2] as u32;
     for (i, byte) in bytes.iter_mut().enumerate() {
         *byte = (carry & 0xff) as u8;
         carry >>= 8;
-        if carry == 0 && i >= nbytes {
+        if carry == 0 {
             nbytes = i + 1;
             break;
         }
     }
 
-    // Multiply by sizes[2] and add nums[1].
-    let mut temp_carry = 0u64;
-    for byte in bytes.iter_mut().take(nbytes) {
-        temp_carry += *byte as u64 * sizes[2] as u64;
-        *byte = (temp_carry & 0xff) as u8;
-        temp_carry >>= 8;
-    }
-    while temp_carry > 0 {
-        bytes[nbytes] = (temp_carry & 0xff) as u8;
-        temp_carry >>= 8;
-        nbytes += 1;
-    }
+    // Pack: result = ((nums[2] * sizes[2] + nums[1]) * sizes[1] + nums[0])
+    multiply_bytes(&mut bytes, &mut nbytes, sizes[2] as u64);
+    add_to_bytes(&mut bytes, &mut nbytes, nums[1] as u64);
+    multiply_bytes(&mut bytes, &mut nbytes, sizes[1] as u64);
+    add_to_bytes(&mut bytes, &mut nbytes, nums[0] as u64);
 
-    // Add nums[1].
-    temp_carry = nums[1] as u64;
-    for byte in bytes.iter_mut().take(nbytes.max(4)) {
-        temp_carry += *byte as u64;
-        *byte = (temp_carry & 0xff) as u8;
-        temp_carry >>= 8;
-    }
-    while temp_carry > 0 {
-        bytes[nbytes] = (temp_carry & 0xff) as u8;
-        temp_carry >>= 8;
-        nbytes += 1;
-    }
-
-    // Multiply by sizes[1] and add nums[0].
-    temp_carry = 0;
-    for byte in bytes.iter_mut().take(nbytes) {
-        temp_carry += *byte as u64 * sizes[1] as u64;
-        *byte = (temp_carry & 0xff) as u8;
-        temp_carry >>= 8;
-    }
-    while temp_carry > 0 {
-        bytes[nbytes] = (temp_carry & 0xff) as u8;
-        temp_carry >>= 8;
-        nbytes += 1;
-    }
-
-    temp_carry = nums[0] as u64;
-    for byte in bytes.iter_mut().take(nbytes.max(4)) {
-        temp_carry += *byte as u64;
-        *byte = (temp_carry & 0xff) as u8;
-        temp_carry >>= 8;
-    }
-    while temp_carry > 0 {
-        bytes[nbytes] = (temp_carry & 0xff) as u8;
-        temp_carry >>= 8;
-        nbytes += 1;
-    }
-
-    // Now write the bytes.
+    // Write the bytes.
     let mut bits_left = nbits;
     let mut byte_idx = 0;
     while bits_left >= 8 {
@@ -204,12 +196,7 @@ fn encodeints(
         bits_left -= 8;
     }
     if bits_left > 0 {
-        encodebits(
-            buf,
-            state,
-            bytes[byte_idx] as u32 & ((1 << bits_left) - 1),
-            bits_left as usize,
-        );
+        encodebits(buf, state, bytes[byte_idx] as u32 & ((1 << bits_left) - 1), bits_left as usize);
     }
 }
 
@@ -223,37 +210,32 @@ const fn sizeofint(size: u32) -> u32 {
     }
 }
 
+/// Calculate total bits needed to represent the product of three sizes.
 fn sizeofints(sizes: [u32; 3]) -> u32 {
-    let mut nbytes = 1usize;
-    let mut bytes = [0u8; 32];
-    bytes[0] = 1;
-    let mut nbits = 0;
+    let mut product_bytes = [0u8; 32];
+    product_bytes[0] = 1;
+    let mut byte_count = 1usize;
 
+    // Multiply all sizes together in byte representation.
     for size in sizes {
-        let mut tmp = 0u32;
-        let mut bytecount = 0;
-        while bytecount < nbytes {
-            tmp += bytes[bytecount] as u32 * size;
-            bytes[bytecount] = (tmp & 0xff) as u8;
-            tmp >>= 8;
-            bytecount += 1;
+        let mut carry = 0u32;
+        for i in 0..byte_count {
+            carry += product_bytes[i] as u32 * size;
+            product_bytes[i] = (carry & 0xff) as u8;
+            carry >>= 8;
         }
-        while tmp != 0 {
-            bytes[bytecount] = (tmp & 0xff) as u8;
-            bytecount += 1;
-            tmp >>= 8;
+        while carry != 0 {
+            product_bytes[byte_count] = (carry & 0xff) as u8;
+            byte_count += 1;
+            carry >>= 8;
         }
-        nbytes = bytecount;
     }
 
-    nbytes -= 1;
-    let mut num = 1u32;
-    while bytes[nbytes] as u32 >= num {
-        nbits += 1;
-        num *= 2;
-    }
+    // Count bits in the most significant byte.
+    let msb_index = byte_count - 1;
+    let msb_bits = sizeofint(product_bytes[msb_index] as u32);
 
-    nbytes as u32 * 8 + nbits
+    msb_index as u32 * 8 + msb_bits
 }
 
 fn calc_sizeint(
@@ -262,17 +244,18 @@ fn calc_sizeint(
     sizeint: &mut [u32; 3],
     bitsizeint: &mut [u32; 3],
 ) -> u32 {
-    for ((size, &min), &max) in sizeint.iter_mut().zip(&minint).zip(&maxint) {
-        *size = (max - min) as u32 + 1;
+    for i in 0..3 {
+        sizeint[i] = (maxint[i] - minint[i]) as u32 + 1;
     }
     bitsizeint.fill(0);
 
-    // Check if one of the sizes is too big to be multiplied.
-    if sizeint.iter().any(|&s| s > 0x00ff_ffff) {
-        for (bits, &size) in bitsizeint.iter_mut().zip(sizeint.iter()) {
-            *bits = sizeofint(size);
+    // Check if any size is too large to multiply safely.
+    let needs_separate_encoding = sizeint.iter().any(|&s| s > MAX_MULTIPLIABLE_SIZE);
+    if needs_separate_encoding {
+        for i in 0..3 {
+            bitsizeint[i] = sizeofint(sizeint[i]);
         }
-        return 0; // Flags use of large sizes.
+        return 0; // Signals separate encoding for each dimension.
     }
 
     sizeofints(*sizeint)
@@ -341,8 +324,6 @@ fn encode_coordinates(
     bitsizeint: &[u32; 3],
     mut smallidx: usize,
 ) {
-    let mut idx = 0usize;
-    let mut prevrun: i32 = -1;
     let lastidx = MAGICINTS.len().saturating_sub(1);
     let maxidx = lastidx.min(smallidx + 8);
     let minidx = maxidx.saturating_sub(8);
@@ -351,98 +332,103 @@ fn encode_coordinates(
     let mut small = MAGICINTS[smallidx] / 2;
     let mut sizesmall = [MAGICINTS[smallidx] as u32; 3];
     let larger = MAGICINTS[maxidx] / 2;
+
+    let mut idx = 0usize;
+    let mut prevrun = 0usize;
+    let mut first_run = true;
     let mut prevcoord = [0; 3];
 
     while idx < coords.len() {
-        let mut is_small = false;
-        let mut is_smaller = if idx >= 1 {
-            if smallidx < maxidx
-                && (coords[idx][0] - prevcoord[0]).abs() < larger
-                && (coords[idx][1] - prevcoord[1]).abs() < larger
-                && (coords[idx][2] - prevcoord[2]).abs() < larger
-            {
-                1
+        // Determine if we should adjust encoding precision.
+        let mut size_change = if idx >= 1 {
+            if smallidx < maxidx && coords_within_threshold(coords[idx], prevcoord, larger) {
+                SizeChange::Increase
             } else if smallidx > minidx {
-                -1
+                SizeChange::Decrease
             } else {
-                0
+                SizeChange::Same
             }
         } else {
-            0
+            SizeChange::Same
         };
 
-        if idx + 1 < coords.len()
-            && (coords[idx][0] - coords[idx + 1][0]).abs() < small
-            && (coords[idx][1] - coords[idx + 1][1]).abs() < small
-            && (coords[idx][2] - coords[idx + 1][2]).abs() < small
-        {
+        // Water swap: if next coord is close, swap to improve compression.
+        let mut can_run = idx + 1 < coords.len()
+            && coords_within_threshold(coords[idx], coords[idx + 1], small);
+        if can_run {
             coords.swap(idx, idx + 1);
-            is_small = true;
         }
 
+        // Encode the current coordinate.
         let coord = coords[idx];
         encode_full_coord(buf, state, coord, minint, bitsize, sizeint, bitsizeint);
         prevcoord = coord;
         idx += 1;
 
-        let mut run: i32 = 0;
-        if !is_small && is_smaller == -1 {
-            is_smaller = 0;
+        // If not starting a run, don't decrease precision.
+        if !can_run && size_change == SizeChange::Decrease {
+            size_change = SizeChange::Same;
         }
 
-        let mut tmpcoord = [0i32; 24];
-        while is_small && run < 8 * 3 && idx < coords.len() {
+        // Collect run-length encoded deltas.
+        let mut run_deltas = [0i32; MAX_RUN_COORDS];
+        let mut run = 0usize;
+
+        while can_run && run < MAX_RUN_COORDS && idx < coords.len() {
             let next = coords[idx];
-            if is_smaller == -1 {
-                let dx = (next[0] - prevcoord[0]) as i64;
-                let dy = (next[1] - prevcoord[1]) as i64;
-                let dz = (next[2] - prevcoord[2]) as i64;
-                let dsq = dx * dx + dy * dy + dz * dz;
-                let threshold = (smaller as i64) * (smaller as i64);
-                if dsq >= threshold {
-                    is_smaller = 0;
+
+            // Check if delta is small enough to keep decreasing precision.
+            if size_change == SizeChange::Decrease {
+                let delta = [
+                    next[0] - prevcoord[0],
+                    next[1] - prevcoord[1],
+                    next[2] - prevcoord[2],
+                ];
+                let dist_sq = delta.iter().map(|&d| (d as i64) * (d as i64)).sum::<i64>();
+                if dist_sq >= (smaller as i64) * (smaller as i64) {
+                    size_change = SizeChange::Same;
                 }
             }
 
-            tmpcoord[run as usize] = next[0] - prevcoord[0] + small;
-            tmpcoord[run as usize + 1] = next[1] - prevcoord[1] + small;
-            tmpcoord[run as usize + 2] = next[2] - prevcoord[2] + small;
+            // Store delta with offset.
+            run_deltas[run] = next[0] - prevcoord[0] + small;
+            run_deltas[run + 1] = next[1] - prevcoord[1] + small;
+            run_deltas[run + 2] = next[2] - prevcoord[2] + small;
             run += 3;
             prevcoord = next;
             idx += 1;
 
-            is_small = false;
-            if idx < coords.len()
-                && (coords[idx][0] - prevcoord[0]).abs() < small
-                && (coords[idx][1] - prevcoord[1]).abs() < small
-                && (coords[idx][2] - prevcoord[2]).abs() < small
-            {
-                is_small = true;
-            }
+            // Check if we can continue the run.
+            can_run = idx < coords.len()
+                && coords_within_threshold(coords[idx], prevcoord, small);
         }
 
-        if run != prevrun || is_smaller != 0 {
+        // Encode run header.
+        let run_changed = first_run || run != prevrun || size_change != SizeChange::Same;
+        first_run = false;
+
+        if run_changed {
             prevrun = run;
             encodebits(buf, state, 1, 1);
-            let run_value = (run + is_smaller + 1) as u32;
+            let size_delta: i32 = match size_change {
+                SizeChange::Decrease => -1,
+                SizeChange::Same => 0,
+                SizeChange::Increase => 1,
+            };
+            let run_value = (run as i32 + size_delta + 1) as u32;
             encodebits(buf, state, run_value, 5);
         } else {
             encodebits(buf, state, 0, 1);
         }
 
-        let mut k = 0;
-        while k < run {
-            let chunk = [
-                tmpcoord[k as usize],
-                tmpcoord[k as usize + 1],
-                tmpcoord[k as usize + 2],
-            ];
-            encodeints(buf, state, smallidx as u32, sizesmall, chunk);
-            k += 3;
+        // Encode run deltas.
+        for chunk in run_deltas[..run].chunks_exact(3) {
+            encodeints(buf, state, smallidx as u32, sizesmall, [chunk[0], chunk[1], chunk[2]]);
         }
 
-        if is_smaller != 0 {
-            if is_smaller < 0 {
+        // Adjust precision for next iteration.
+        match size_change {
+            SizeChange::Decrease => {
                 smallidx = smallidx.saturating_sub(1);
                 small = smaller;
                 smaller = if smallidx > FIRSTIDX {
@@ -450,12 +436,15 @@ fn encode_coordinates(
                 } else {
                     0
                 };
-            } else {
+                sizesmall.fill(MAGICINTS[smallidx] as u32);
+            }
+            SizeChange::Increase => {
                 smallidx = (smallidx + 1).min(lastidx);
                 smaller = small;
                 small = MAGICINTS[smallidx] / 2;
+                sizesmall.fill(MAGICINTS[smallidx] as u32);
             }
-            sizesmall.fill(MAGICINTS[smallidx] as u32);
+            SizeChange::Same => {}
         }
     }
 }
