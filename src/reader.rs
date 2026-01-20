@@ -9,7 +9,6 @@ struct DecodeState {
     lastbyte: u8,
 }
 
-// TODO: I have a constexpr laying around for this somewhere.
 #[rustfmt::skip]
 pub const MAGICINTS: [i32; 73] = [
     0,        0,        0,       0,       0,       0,       0,       0,       0,       8,
@@ -22,6 +21,9 @@ pub const MAGICINTS: [i32; 73] = [
     10568983, 13316085, 16777216
 ];
 pub const FIRSTIDX: usize = 9; // Note that MAGICINTS[FIRSTIDX-1] == 0.
+
+/// Maximum size that can be safely multiplied without overflow in sizeofints.
+const MAX_MULTIPLIABLE_SIZE: u32 = 0x00ff_ffff;
 
 /// The number of bytes that together form the prelude of `maxint`, `minint`, and `smallidx`.
 pub const NBYTES_POSITIONS_PRELUDE: usize = 7 * 4;
@@ -61,7 +63,7 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
 
     let invprecision = precision.recip();
 
-    // TODO: Once `array_try_map` is stable, both of these inits can be cleaned up significantly.
+    // Note: `array_try_map` (stable in Rust 1.79) would simplify this, but MSRV is 1.74.1.
     let minint = [0; 3]
         .map(|_| read_i32(file))
         .into_iter()
@@ -88,10 +90,7 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
     let mut bitsizeint = [0u32; 3];
     let bitsize = calc_sizeint(minint, maxint, &mut sizeint, &mut bitsizeint);
 
-    let tmpidx = smallidx - 1;
-    let tmpidx = if FIRSTIDX > tmpidx { FIRSTIDX } else { tmpidx };
-
-    let mut smaller = MAGICINTS[tmpidx] / 2;
+    let mut smaller = MAGICINTS[smallidx.saturating_sub(1).max(FIRSTIDX)] / 2;
     let mut smallnum = MAGICINTS[smallidx] / 2;
     let mut sizesmall = [MAGICINTS[smallidx] as u32; 3];
 
@@ -162,13 +161,6 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
             is_smaller -= 1;
         }
         if run > 0 {
-            // TODO: Investigate whether this is something we can just remove. I believe it may be.
-            // if write_idx * 3 + run as usize > n {
-            //     eprintln!("may attempt to write a run beyond the positions buffer");
-            //     dbg!(write_idx, run, n, write_idx * 3 + run as usize);
-            // }
-
-            // Let's read the next coordinate.
             coord.fill(0);
 
             for k in (0..run).step_by(3) {
@@ -179,8 +171,6 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
                     sizesmall,
                     &mut coord,
                 );
-                // let mut current_coord_read_idx = read_idx;
-                // read_idx += 1;
                 coord[0] += prevcoord[0] - smallnum;
                 coord[1] += prevcoord[1] - smallnum;
                 coord[2] += prevcoord[2] - smallnum;
@@ -264,7 +254,6 @@ pub(crate) fn read_f32s<R: Read>(file: &mut R, buf: &mut [f32]) -> io::Result<()
     Ok(())
 }
 
-// FIXME: These read_* functions are prime targets for a macro tbh.
 pub(crate) fn read_f32<R: Read>(file: &mut R) -> io::Result<f32> {
     let mut buf: [u8; 4] = Default::default();
     file.read_exact(&mut buf)?;
@@ -309,96 +298,71 @@ fn calc_sizeint(
 
     bitsizeint.fill(0);
 
-    // Check if one of the sizes is too big to be multiplied.
-    if (sizeint[0] | sizeint[1] | sizeint[2]) > 0xffffff {
+    // Check if any size is too large to multiply safely.
+    if (sizeint[0] | sizeint[1] | sizeint[2]) > MAX_MULTIPLIABLE_SIZE {
         bitsizeint[0] = sizeofint(sizeint[0]);
         bitsizeint[1] = sizeofint(sizeint[1]);
         bitsizeint[2] = sizeofint(sizeint[2]);
-        return 0; // This flags the use of large sizes. // FIXME: This can become an enum to be more explicit?
+        return 0; // Signals separate encoding for each dimension.
     }
 
     sizeofints(*sizeint)
 }
 
+/// Calculate minimum bits needed such that 2^bits > size.
 #[inline]
 const fn sizeofint(size: u32) -> u32 {
-    let mut n = 1;
-    let mut nbits = 0;
-
-    while size >= n && nbits < 32 {
-        nbits += 1;
-        n <<= 1;
-    }
-
-    nbits
+    u32::BITS - size.leading_zeros()
 }
 
-fn sizeofints(sizes: [u32; 3]) -> u32 {
-    let mut nbytes = 1;
-    let mut bytes = [0u8; 32];
-    bytes[0] = 1;
-    let mut nbits = 0;
+/// Calculate total bits needed to represent the product of three sizes.
+const fn sizeofints(sizes: [u32; 3]) -> u32 {
+    let mut product_bytes = [0u8; 32];
+    product_bytes[0] = 1;
+    let mut byte_count = 1usize;
 
-    for size in sizes {
-        let mut tmp = 0;
-        let mut bytecount = 0;
-        while bytecount < nbytes {
-            tmp += bytes[bytecount] as u32 * size;
-            bytes[bytecount] = (tmp & 0xff) as u8;
-            tmp >>= 8;
-            bytecount += 1;
+    // Multiply all sizes together in byte representation.
+    let mut size_idx = 0;
+    while size_idx < 3 {
+        let size = sizes[size_idx];
+        let mut carry = 0u32;
+        let mut i = 0;
+        while i < byte_count {
+            carry += product_bytes[i] as u32 * size;
+            product_bytes[i] = (carry & 0xff) as u8;
+            carry >>= 8;
+            i += 1;
         }
-        while tmp != 0 {
-            bytes[bytecount] = (tmp & 0xff) as u8;
-            bytecount += 1;
-            tmp >>= 8;
+        while carry != 0 {
+            product_bytes[byte_count] = (carry & 0xff) as u8;
+            byte_count += 1;
+            carry >>= 8;
         }
-        nbytes = bytecount;
+        size_idx += 1;
     }
 
-    nbytes -= 1;
-    let mut num = 1;
-    while bytes[nbytes] as u32 >= num {
-        nbits += 1;
-        num *= 2;
-    }
+    // Count bits in the most significant byte.
+    let msb_index = byte_count - 1;
+    let msb_bits = sizeofint(product_bytes[msb_index] as u32);
 
-    nbytes as u32 * 8 + nbits // FIXME: Check whether it is okay for nbytes to have the type of usize not u32
+    msb_index as u32 * 8 + msb_bits
 }
 
-fn decodebyte<'s, 'r, R>(buf: &mut impl Buffered<'s, 'r, R>, state: &mut DecodeState) -> u8 {
-    let mask = 0xff;
-
-    let DecodeState {
-        mut lastbits,
-        lastbyte,
-    } = *state;
+/// Decode exactly 8 bits (one byte) from the buffer.
+#[inline]
+fn decodebyte<'s, 'r, R: Read>(buf: &mut impl Buffered<'s, 'r, R>, state: &mut DecodeState) -> u8 {
+    let DecodeState { lastbits, lastbyte } = *state;
     let mut lastbyte = lastbyte as u32;
 
-    let mut num = 0;
-    let mut nbits = 8;
-    while nbits >= 8 {
-        lastbyte = (lastbyte << 8) | buf.pop() as u32;
-        num |= (lastbyte >> lastbits) << (nbits - 8);
-        nbits -= 8;
-    }
+    // Read one byte and extract 8 bits.
+    lastbyte = (lastbyte << 8) | buf.pop() as u32;
+    let num = (lastbyte >> lastbits) & 0xff;
 
-    if nbits > 0 {
-        if lastbits < nbits {
-            lastbits += 8;
-            lastbyte = (lastbyte << 8) | buf.pop() as u32;
-        }
-        lastbits -= nbits;
-        num |= (lastbyte >> lastbits) & mask;
-    }
-
-    num &= mask;
     *state = DecodeState {
         lastbits,
-        lastbyte: (lastbyte & 0xff) as u8, // We don't care about anything but the last byte.
+        lastbyte: (lastbyte & 0xff) as u8,
     };
 
-    debug_assert_eq!(num & 0xff, num);
     num as u8
 }
 
@@ -450,107 +414,81 @@ fn decodeints<'s, 'r, R: Read>(
     sizes: [u32; 3],
     nums: &mut [i32; 3],
 ) {
+    // Fast paths for values that fit in 32 or 64 bits.
     if nbits <= 32 {
-        unpack_from_int_into_u32(buf, state, nbits, sizes, nums);
+        unpack_packed_ints_u32(buf, state, nbits, sizes, nums);
         return;
     }
     if nbits <= 64 {
-        unpack_from_int_into_u64(buf, state, nbits, sizes, nums);
+        unpack_packed_ints_u64(buf, state, nbits, sizes, nums);
         return;
     }
 
+    // Slow path for very large values (>64 bits): use byte array.
     let mut bytes = [0u8; 32];
-    let mut nbytes: usize = 0;
+    let mut byte_count = 0usize;
     while nbits >= 8 {
-        bytes[nbytes] = decodebyte(buf, state);
-        nbytes += 1;
+        bytes[byte_count] = decodebyte(buf, state);
+        byte_count += 1;
         nbits -= 8;
     }
     if nbits > 0 {
-        bytes[nbytes] = decodebits(buf, state, nbits as usize);
-        nbytes += 1;
+        bytes[byte_count] = decodebits(buf, state, nbits as usize);
+        byte_count += 1;
     }
 
+    // Unpack by repeated division, MSB first.
     for i in (1..=2).rev() {
-        let mut num: u32 = 0;
-        for j in 0..nbytes {
-            let k = nbytes - 1 - j;
-            num = (num << 8) | bytes[k] as u32;
-            let p = num / sizes[i];
-            bytes[k] = p as u8;
-            num -= p * sizes[i];
+        let mut remainder = 0u32;
+        for j in (0..byte_count).rev() {
+            remainder = (remainder << 8) | bytes[j] as u32;
+            bytes[j] = (remainder / sizes[i]) as u8;
+            remainder %= sizes[i];
         }
-        nums[i] = num as i32;
+        nums[i] = remainder as i32;
     }
 
     nums[0] = i32::from_le_bytes(bytes[..4].try_into().unwrap());
 }
 
-fn unpack_from_int_into_u32<'s, 'r, R: Read>(
-    buf: &mut impl Buffered<'s, 'r, R>,
-    state: &mut DecodeState,
-    mut nbits: u32,
-    sizes: [u32; 3],
-    nums: &mut [i32; 3],
-) {
-    type T = u32;
-    let mut v: T = 0;
-    let mut nbytes: usize = 0;
-    while nbits >= 8 {
-        let byte: T = decodebyte(buf, state) as T;
-        v |= byte << (8 * nbytes as u32);
-        nbytes += 1;
-        nbits -= 8;
-    }
-    if nbits > 0 {
-        let byte: T = decodebits(buf, state, nbits as usize);
-        v |= byte << (8 * nbytes as u32);
-    }
+/// Generate an unpack function for a specific integer type.
+macro_rules! impl_unpack_packed_ints {
+    ($name:ident, $T:ty) => {
+        fn $name<'s, 'r, R: Read>(
+            buf: &mut impl Buffered<'s, 'r, R>,
+            state: &mut DecodeState,
+            mut nbits: u32,
+            sizes: [u32; 3],
+            nums: &mut [i32; 3],
+        ) {
+            // Read packed value LSB-first.
+            let mut packed: $T = 0;
+            let mut byte_idx = 0u32;
+            while nbits >= 8 {
+                packed |= (decodebyte(buf, state) as $T) << (8 * byte_idx);
+                byte_idx += 1;
+                nbits -= 8;
+            }
+            if nbits > 0 {
+                let byte: $T = decodebits(buf, state, nbits as usize);
+                packed |= byte << (8 * byte_idx);
+            }
 
-    // FIXME: What's up with the whole FastType stuff here?
-    let sz: T = sizes[2];
-    let sy: T = sizes[1];
-    let szy: T = sz * sy;
-    let x1 = v / szy;
-    let q1 = v - x1 * szy;
-    let y1 = q1 / sz;
-    let z1 = q1 - y1 * sz;
+            // Unpack: packed = x * (sy * sz) + y * sz + z
+            let sz = sizes[2] as $T;
+            let szy = sizes[1] as $T * sz;
+            let x = packed / szy;
+            let remainder = packed - x * szy;
+            let y = remainder / sz;
+            let z = remainder - y * sz;
 
-    *nums = [x1, y1, z1].map(|v| v as i32);
+            *nums = [x as i32, y as i32, z as i32];
+        }
+    };
 }
 
-fn unpack_from_int_into_u64<'s, 'r, R: Read>(
-    buf: &mut impl Buffered<'s, 'r, R>,
-    state: &mut DecodeState,
-    mut nbits: u32,
-    sizes: [u32; 3],
-    nums: &mut [i32; 3],
-) {
-    type T = u64;
-    let mut v: T = 0;
-    let mut nbytes: usize = 0;
-    while nbits >= 8 {
-        let byte: T = decodebyte(buf, state) as T;
-        v |= byte << (8 * nbytes as u32);
-        nbytes += 1;
-        nbits -= 8;
-    }
-    if nbits > 0 {
-        let byte: T = decodebits(buf, state, nbits as usize);
-        v |= byte << (8 * nbytes as u32);
-    }
-
-    // FIXME: What's up with the whole FastType stuff here?
-    let sz: T = sizes[2] as u64;
-    let sy: T = sizes[1] as u64;
-    let szy: T = sz * sy;
-    let x1 = v / szy;
-    let q1 = v - x1 * szy;
-    let y1 = q1 / sz;
-    let z1 = q1 - y1 * sz;
-
-    *nums = [x1, y1, z1].map(|v| v as i32);
-}
+impl_unpack_packed_ints!(unpack_packed_ints_u32, u32);
+impl_unpack_packed_ints!(unpack_packed_ints_u64, u64);
 
 #[cfg(test)]
 mod tests {
