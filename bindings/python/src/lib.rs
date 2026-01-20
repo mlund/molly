@@ -333,6 +333,41 @@ impl XTCReader {
     }
 }
 
+/// A fast XTC trajectory writer.
+#[pyclass]
+struct XTCWriter {
+    inner: Option<molly::XTCWriter<std::io::BufWriter<std::fs::File>>>,
+}
+
+#[pymethods]
+impl XTCWriter {
+    /// Create a new XTC file at the given path.
+    #[new]
+    fn create(path: PathBuf) -> io::Result<Self> {
+        let file = std::fs::File::create(path)?;
+        let writer = std::io::BufWriter::new(file);
+        Ok(Self {
+            inner: Some(molly::XTCWriter::new(writer)),
+        })
+    }
+
+    /// Write a frame to the XTC file.
+    fn write_frame(&mut self, frame: &Frame) -> io::Result<()> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Writer is closed"))?
+            .write_frame(&frame.inner)
+    }
+
+    /// Close the writer and flush all buffered data.
+    fn close(&mut self) -> io::Result<()> {
+        if let Some(writer) = self.inner.take() {
+            writer.file.into_inner()?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
 /// A single trajectory frame.
 ///
 /// All distances are given in nanometers.
@@ -350,14 +385,30 @@ impl From<molly::Frame> for Frame {
 
 #[pymethods]
 impl Frame {
+    /// Create a new empty frame.
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
     #[getter]
     fn get_step(&self) -> u32 {
         self.inner.step
     }
 
+    #[setter]
+    fn set_step(&mut self, step: u32) {
+        self.inner.step = step;
+    }
+
     #[getter]
     fn get_time(&self) -> f32 {
         self.inner.time
+    }
+
+    #[setter]
+    fn set_time(&mut self, time: f32) {
+        self.inner.time = time;
     }
 
     /// The box vectors of this frame as an array of columns of a 3×3 matrix.
@@ -366,9 +417,19 @@ impl Frame {
         self.inner.boxvec.to_cols_array_2d()
     }
 
+    #[setter]
+    fn set_box(&mut self, boxvec: BoxVec) {
+        self.inner.boxvec = molly::BoxVec::from_cols_array_2d(&boxvec);
+    }
+
     #[getter]
     fn get_precision(&self) -> f32 {
         self.inner.precision
+    }
+
+    #[setter]
+    fn set_precision(&mut self, precision: f32) {
+        self.inner.precision = precision;
     }
 
     /// Get the positions as an `np.ndarray`.
@@ -384,14 +445,28 @@ impl Frame {
             .unwrap()
             .into_pyarray(py)
     }
+
+    /// Set positions from a flat list of floats (x1, y1, z1, x2, y2, z2, ...).
+    #[setter]
+    fn set_positions(&mut self, positions: Vec<f32>) -> PyResult<()> {
+        if positions.len() % 3 != 0 {
+            return Err(PyValueError::new_err(
+                "positions length must be divisible by 3",
+            ));
+        }
+        self.inner.positions = positions;
+        Ok(())
+    }
 }
 
-/// Read xtc files, fast.
+/// Read and write xtc files, fast.
 ///
 /// Marieke Westendorp, 2024.
 #[pymodule]
 fn _molly(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<XTCReader>()?;
+    m.add_class::<XTCWriter>()?;
+    m.add_class::<Frame>()?;
 
     Ok(())
 }

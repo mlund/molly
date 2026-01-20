@@ -1,3 +1,4 @@
+import tempfile
 import time
 from sys import stdout
 
@@ -109,6 +110,50 @@ def read_test(path, full_mda_frames, frame_selection=None, atom_selection=None):
     print(f"\tOK!\t\tReading took {dur:8.3} s.")
 
 
+def test_write_roundtrip(path):
+    """Test writing frames and reading them back."""
+    print(f"TEST: write roundtrip, {path = }")
+
+    # Read original frames.
+    reader = molly.XTCReader(path)
+    original_frames = reader.read_frames()
+    nframes = len(original_frames)
+    print(f"\tRead {nframes} frames from original file")
+
+    # Write to temp file.
+    with tempfile.NamedTemporaryFile(suffix=".xtc", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    writer = molly.XTCWriter(tmp_path)
+    start = time.time()
+    for frame in original_frames:
+        writer.write_frame(frame)
+    writer.close()
+    write_duration = time.time() - start
+    print(f"\tWrote {nframes} frames in {write_duration:.3f} s")
+
+    # Read back and verify.
+    reader2 = molly.XTCReader(tmp_path)
+    roundtrip_frames = reader2.read_frames()
+
+    assert len(roundtrip_frames) == len(original_frames), \
+        f"Frame count mismatch: {len(roundtrip_frames)} != {len(original_frames)}"
+
+    for i, (orig, rt) in enumerate(zip(original_frames, roundtrip_frames)):
+        assert orig.step == rt.step, f"Frame {i}: step mismatch"
+        assert orig.time == rt.time, f"Frame {i}: time mismatch"
+        assert orig.precision == rt.precision, f"Frame {i}: precision mismatch"
+        assert np.allclose(orig.box, rt.box), f"Frame {i}: box mismatch"
+        assert np.allclose(orig.positions, rt.positions, atol=1e-5), \
+            f"Frame {i}: positions mismatch"
+
+    # Clean up.
+    import os
+    os.unlink(tmp_path)
+
+    print(f"\tOK!\t\tRoundtrip verified for {nframes} frames.")
+
+
 path = "../../tests/trajectories/trajectory_smol.xtc"
 full_mda_frames, _ = read_all(path)
 
@@ -122,3 +167,6 @@ read_test(path, full_mda_frames, slice(25, 50, 2))
 read_test(path, full_mda_frames, slice(None, None, 3))
 read_test(path, full_mda_frames, slice(None, 20, 3))
 read_test(path, full_mda_frames, slice(25, 50, 3))
+
+# Write roundtrip test.
+test_write_roundtrip(path)

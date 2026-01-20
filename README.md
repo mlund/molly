@@ -6,7 +6,7 @@
 
 ![molly logo](molly.svg)
 
-A reader for the Gromacs [xtc file format][xtc] implemented in pure Rust.
+A reader and writer for the Gromacs [xtc file format][xtc] implemented in pure Rust.
 
 _molly_ tries to decompress and read the minimal number of bytes from disk. To
 this end, the library features extensive selection methods for **frames**
@@ -19,6 +19,9 @@ subset of positions at the top-end of the frame is selected in a large
 trajectory.
 Such buffered reading can be very beneficial when disk read speed is
 particularly poor, such as over networked file storage.
+
+_molly_ also supports **writing** XTC files, enabling roundtrip workflows where
+trajectories can be read, processed, and written back out.
 
 For convenient use in existing analysis tools, _molly_ exposes a set of
 bindings that allow access to its functions from Python.
@@ -79,6 +82,20 @@ molly big.xtc rev_last_ten.xtc -rRf :10 --steps --times
 To use _molly_ in a Rust project, add this repository to the dependencies in
 your `Cargo.toml`.
 Find [_molly_ on crates.io][crates].
+
+```rust
+use molly::{XTCReader, XTCWriter, Frame};
+
+// Read frames from a trajectory
+let mut reader = XTCReader::open("input.xtc")?;
+let frames = reader.read_all_frames()?;
+
+// Write frames to a new file
+let mut writer = XTCWriter::create("output.xtc")?;
+for frame in frames.iter() {
+    writer.write_frame(frame)?;
+}
+```
 
 ### As a Python module
 
@@ -170,6 +187,16 @@ the top of each frame is selected, the advantage is considerable.
 [crates]: https://crates.io/crates/molly
 [xdrf]: https://gitlab.com/gromacs/gromacs/-/blob/d8d6543db04563cb15f71c90ffb5ed2fda092bce/src/gromacs/fileio/xdrf.h
 [chemfiles]: https://chemfiles.org/
+
+## XTC Writer Features
+
+| Feature | Status | Location |
+|---------|--------|----------|
+| Full coordinate encoding | ✓ | `encode_full_coord` |
+| Run-length encoding | ✓ | `encode_coordinates` |
+| Water swap | ✓ | `coords.swap(idx, idx + 1)` |
+| Adaptive precision | ✓ | `smallidx` adjustment |
+| Large coordinate handling | ✓ | `encodeints` byte-array path |
 
 ---
 
