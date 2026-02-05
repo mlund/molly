@@ -17,6 +17,34 @@ pub mod reader;
 pub mod selection;
 pub mod writer;
 
+/// Tracks whether the encoding precision should change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SizeChange {
+    Decrease,
+    Same,
+    Increase,
+}
+
+impl SizeChange {
+    /// Decode from XTC format bits (0,1,2 → Decrease,Same,Increase).
+    const fn from_encoded(bits: i32) -> Self {
+        match bits {
+            0 => Self::Decrease,
+            1 => Self::Same,
+            _ => Self::Increase,
+        }
+    }
+
+    /// Encode to XTC format bits (Decrease,Same,Increase → 0,1,2).
+    const fn to_encoded(self) -> i32 {
+        match self {
+            Self::Decrease => 0,
+            Self::Same => 1,
+            Self::Increase => 2,
+        }
+    }
+}
+
 // See https://gitlab.com/gromacs/gromacs/-/blob/v2024.1/src/gromacs/fileio/xdrf.h?ref_type=tags#L78
 pub const XTC_1995_MAX_NATOMS: usize = 298261617;
 

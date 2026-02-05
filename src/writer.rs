@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use crate::reader::{FIRSTIDX, MAGICINTS};
-use crate::{padding, Magic};
+use crate::{padding, Magic, SizeChange};
 
 /// XDR padding bytes.
 const ZERO_PAD: [u8; 3] = [0; 3];
@@ -11,14 +11,6 @@ const MAX_MULTIPLIABLE_SIZE: u32 = 0x00ff_ffff;
 
 /// Maximum run length: 8 coordinate triplets.
 const MAX_RUN_COORDS: usize = 8 * 3;
-
-/// Tracks whether the encoding precision should change.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SizeChange {
-    Decrease,
-    Same,
-    Increase,
-}
 
 /// Check if all coordinate components are within threshold of each other.
 #[inline]
@@ -417,12 +409,8 @@ fn encode_coordinates(
         if run_changed {
             prevrun = run;
             encodebits(buf, state, 1, 1);
-            let size_delta: i32 = match size_change {
-                SizeChange::Decrease => -1,
-                SizeChange::Same => 0,
-                SizeChange::Increase => 1,
-            };
-            let run_value = (run as i32 + size_delta + 1) as u32;
+            // The 5-bit value encodes run length (multiple of 3) and size change bits.
+            let run_value = (run as i32 + size_change.to_encoded()) as u32;
             encodebits(buf, state, run_value, 5);
         } else {
             encodebits(buf, state, 0, 1);

@@ -2,7 +2,7 @@ use std::io::{self, Read};
 
 use crate::buffer::Buffered;
 use crate::selection::AtomSelection;
-use crate::{BoxVec, Magic};
+use crate::{BoxVec, Magic, SizeChange};
 
 struct DecodeState {
     lastbits: usize,
@@ -153,14 +153,14 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
             };
         }
 
-        let flag: bool = decodebits::<u8, R>(&mut buffer, &mut state, 1) > 0;
-        let mut is_smaller = 0;
-        if flag {
-            run = decodebits::<_, R>(&mut buffer, &mut state, 5);
-            is_smaller = run % 3;
-            run -= is_smaller;
-            is_smaller -= 1;
-        }
+        // The 5-bit value encodes run length (multiple of 3) and size change bits.
+        let size_change = if decodebits::<u8, R>(&mut buffer, &mut state, 1) > 0 {
+            let encoded = decodebits::<i32, R>(&mut buffer, &mut state, 5);
+            run = (encoded / 3) * 3;
+            SizeChange::from_encoded(encoded % 3)
+        } else {
+            SizeChange::Same
+        };
         if run > 0 {
             // TODO: Investigate whether this is something we can just remove. I believe it may be.
             // if write_idx * 3 + run as usize > n {
@@ -207,8 +207,8 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
             write_position!(position, write_idx, read_idx, coord);
         }
 
-        match is_smaller.cmp(&0) {
-            std::cmp::Ordering::Less => {
+        match size_change {
+            SizeChange::Decrease => {
                 smallidx -= 1;
                 smallnum = smaller;
                 if smallidx > FIRSTIDX {
@@ -217,12 +217,12 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
                     smaller = 0;
                 }
             }
-            std::cmp::Ordering::Greater => {
+            SizeChange::Increase => {
                 smallidx += 1;
                 smaller = smallnum;
                 smallnum = MAGICINTS[smallidx] / 2;
             }
-            std::cmp::Ordering::Equal => {}
+            SizeChange::Same => {}
         }
 
         assert_ne!(MAGICINTS[smallidx], 0, "found an invalid size");
