@@ -92,7 +92,9 @@ impl Header {
         let natoms_repeated = read_u32(file)?
             .try_into()
             .map_err(|err| io::Error::other(format!("could not read second natoms: {err}")))?;
-        assert_eq!(natoms, natoms_repeated);
+        if natoms != natoms_repeated {
+            return Err(io::Error::other("malformed header: natoms mismatch"));
+        }
 
         Ok(Header {
             magic,
@@ -119,7 +121,7 @@ impl Header {
                 .iter()
                 .flatten(),
         ); // 9 × f32
-        assert_eq!(self.natoms, self.natoms_repeated);
+        debug_assert_eq!(self.natoms, self.natoms_repeated);
         bytes.extend(natoms); // u32
 
         bytes.try_into().unwrap()
@@ -145,7 +147,7 @@ impl Frame {
     /// Returns the number of atoms in this [`Frame`].
     pub fn natoms(&self) -> usize {
         let npos = self.positions.len();
-        assert_eq!(
+        debug_assert_eq!(
             npos % 3,
             0,
             "the number of single positions in a frame must always be a multiple of 3"

@@ -43,7 +43,9 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
 ) -> io::Result<usize> {
     let natoms_out = {
         let n = positions.len();
-        assert_eq!(n % 3, 0, "the length of `positions` must be divisible by 3");
+        if n % 3 != 0 {
+            return Err(io::Error::other("positions length must be divisible by 3"));
+        }
         n / 3
     };
 
@@ -75,14 +77,16 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
         .try_into()
         .unwrap();
     let smallidx = read_u32(file)?;
-    assert_eq!(
+    debug_assert_eq!(
         std::mem::size_of_val(&minint)
             + std::mem::size_of_val(&maxint)
             + std::mem::size_of_val(&smallidx),
         NBYTES_POSITIONS_PRELUDE
     );
     let mut smallidx = smallidx as usize;
-    assert!(smallidx < MAGICINTS.len());
+    if smallidx >= MAGICINTS.len() {
+        return Err(io::Error::other("malformed file: smallidx out of bounds"));
+    }
 
     let mut sizeint = [0u32; 3];
     let mut bitsizeint = [0u32; 3];
@@ -107,7 +111,7 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
     let mut write_idx = 0;
     let mut read_idx = 0;
     // The number of positions to be read to fulfill an AtomSelection may not be equal to natoms!
-    assert!(header_natoms >= natoms_out);
+    debug_assert!(header_natoms >= natoms_out);
     let limit = atom_selection.reading_limit(header_natoms);
     'decompress: while read_idx < limit {
         let mut coord = [0i32; 3];
@@ -225,7 +229,7 @@ pub fn read_compressed_positions<'s, 'r, B: Buffered<'s, 'r, R>, R: Read>(
             std::cmp::Ordering::Equal => {}
         }
 
-        assert_ne!(MAGICINTS[smallidx], 0, "found an invalid size");
+        debug_assert_ne!(MAGICINTS[smallidx], 0, "found an invalid size");
         sizesmall.fill(MAGICINTS[smallidx] as u32);
     }
 

@@ -270,17 +270,17 @@ fn calc_sizeint(
 /// Returns the number of compressed bytes written.
 ///
 /// # Errors
-/// Returns an error if writing to the underlying writer fails.
-///
-/// # Panics
-/// Panics if `positions.len()` is not divisible by 3.
+/// Returns an error if writing to the underlying writer fails, or if
+/// `positions.len()` is not divisible by 3.
 pub fn write_compressed_positions<W: Write>(
     writer: &mut W,
     positions: &[f32],
     precision: f32,
     magic: Magic,
 ) -> io::Result<usize> {
-    assert_eq!(positions.len() % 3, 0);
+    if positions.len() % 3 != 0 {
+        return Err(io::Error::other("positions length must be divisible by 3"));
+    }
 
     let to_int = |f: f32| (f * precision).round() as i32;
     let mut int_coords: Vec<[i32; 3]> = positions
